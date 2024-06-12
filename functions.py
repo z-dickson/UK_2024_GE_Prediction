@@ -4,6 +4,7 @@ import polars as pl
 import os
 import pyreadstat 
 from tqdm import tqdm
+from time import time
 
 
 # import geopandas to plot maps 
