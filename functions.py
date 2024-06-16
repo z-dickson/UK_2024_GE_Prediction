@@ -5,7 +5,35 @@ import os
 import pyreadstat 
 from tqdm import tqdm
 from time import time
+# create xgboost prediction model to predict the 2015 election results 
 
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import StandardScaler
+
+# Metrics
+from sklearn.metrics import mean_squared_error
+from sklearn.metrics import make_scorer
+
+# Skopt functions
+from skopt import BayesSearchCV
+from skopt.callbacks import DeadlineStopper, DeltaYStopper
+from skopt.space import Real, Categorical, Integer
+
+
+import pprint
+import joblib
+from functools import partial
+
+# Data processing
+from sklearn.preprocessing import OrdinalEncoder
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
+
+# Model selection
+from sklearn.model_selection import KFold, StratifiedKFold
 
 # import geopandas to plot maps 
 import geopandas as gpd
@@ -22,6 +50,13 @@ def get_data(url):
         return None
     
     
+def index_by_constituency(df, col, new_col_name):
+    x = df.groupby(['Westminster Parliamentary constituencies Code', col]).agg({'Observation': 'sum'}).reset_index()
+    x[new_col_name] = x['Observation'] / x.groupby(['Westminster Parliamentary constituencies Code'])['Observation'].transform('sum')
+    ## Merge the data so that we have new columns for each of the categories
+    x = x.pivot(index='Westminster Parliamentary constituencies Code', columns=col).reset_index()
+    return x
+
     
 def yougov_polls(sheet_name):
     try: 
@@ -33,8 +68,11 @@ def yougov_polls(sheet_name):
     df.columns = df.iloc[0]
     df = df[1:]
     df = df.reset_index()
-    df.rename(columns={'index':'date'}, inplace=True)
-    df['population'] = sheet_name
+    df.rename(columns={'index':'date','If there were a general election held tomorrow, which party would you vote for?': 'poll'}, inplace=True)
+    
+    df['demographic'] = sheet_name
+    # add suffix to columns 
+    #df.columns = [f'vote_intention_{c}' for c in df.columns]
     
     return df 
     
@@ -134,28 +172,24 @@ def impute_loc_codes(df):
 # vars to convert to numeric 
 
 
-def create_dummies(df):
-    vars_to_convert = ['leftRight', 'likeCon', 'likeLD', 'likeLab',
-        'likePC', 'likeSNP', 'p_hh_children', 'p_hh_size', 'age']
+def create_dummies(df, cols):
+    for col in tqdm(cols):
+        df = pd.concat([df, pd.get_dummies(df[col], prefix=col)], axis = 1)
+    return df
 
-    vars_to_ignore = ['starttime', 'endtime', 'id', 'wave', 'pcon_code', 'msoa11', 'pcon_code_imputed', 'msoa11_imputed', 'oslaua', 'oslaua_code', 'pcon', 'pano']
 
-    for var in vars_to_convert:
-        df[var] = pd.to_numeric(df[var], errors='coerce')
-        
-    for var in tqdm(df.columns): 
-        if var not in vars_to_convert and var not in vars_to_ignore:
-            df = pd.concat([df, pd.get_dummies(df[var], prefix=var)], axis = 1)
-            
+def create_factors(df, cols):
+    for col in cols:
+        df[f'{col}_factor'] = df[col].factorize()[0]
     return df
 
 
 def assign_elections(df):
     
-    df.loc[(df.wave > 2) & (df.wave <= 5), 'election'] = 2015
-    df.loc[(df.wave > 9) & (df.wave <= 12), 'election'] = 2017
-    df.loc[(df.wave > 13) & (df.wave < 17), 'election'] = 2019
-    df.loc[df.wave >= 23, 'election'] = 2024
+    df.loc[(df.wave > 4) & (df.wave <= 5), 'election'] = 2015
+    df.loc[(df.wave > 11) & (df.wave <= 12), 'election'] = 2017
+    df.loc[(df.wave > 16) & (df.wave <= 17), 'election'] = 2019
+    df.loc[df.wave >= 25, 'election'] = 2024
 
     df = df.loc[df.election.notnull()]
     return df 
@@ -215,3 +249,103 @@ def report_perf(optimizer, X, y, title="model", callbacks=None):
     print(best_params)
     print()
     return best_params
+
+
+
+
+def xgboost_model(cols_to_drop,
+                  df,
+                  target_var,
+                  search_space,
+                  time, 
+                  folds):
+
+    X = df.drop(cols_to_drop, axis = 1)
+
+    Y = df[target_var]
+
+    #from sklearn.preprocessing import StandardScaler
+    #scaler = StandardScaler()
+
+
+    #x_Scaled = scaler.fit_transform(X)
+
+    X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2, random_state=123)
+
+    X_train = X_train.set_index(['PCON25CD_imputed', 'election'])
+    X_test = X_test.set_index(['PCON25CD_imputed', 'election'])
+
+
+    y_stratified = pd.cut(y_train.rank(method='first'), bins=10, labels=False)
+
+    # Winsorizing lower bounds
+    from scipy.stats.mstats import winsorize
+    y_train = np.array(winsorize(y_train, [0.008, 0.0]))
+    
+    # Reporting util for different optimizers
+
+    # Setting the scoring function
+    scoring = make_scorer(partial(mean_squared_error, squared=False), 
+                        greater_is_better=False)
+
+    # Setting the validation strategy
+    skf = StratifiedKFold(n_splits=7,
+                        shuffle=True, 
+                        random_state=0)
+
+    cv_strategy = list(skf.split(X_train, y_stratified))
+    
+    # Wrapping everything up into the Bayesian optimizer
+    opt = BayesSearchCV(estimator=reg,                                    
+                        search_spaces=search_spaces,                      
+                        scoring=scoring,                                  
+                        cv=cv_strategy,                                           
+                        n_iter=120,                                       # max number of trials
+                        n_points=1,                                       # number of hyperparameter sets evaluated at the same time
+                        n_jobs=1,                                         # number of jobs
+                        iid=False,                                        # if not iid it optimizes on the cv score
+                        return_train_score=False,                         
+                        refit=False,                                      
+                        optimizer_kwargs={'base_estimator': 'GP'},        # optmizer parameters: we use Gaussian Process (GP)
+                        random_state=0)  
+    
+    from time import time
+
+    # Running the optimizer
+    overdone_control = DeltaYStopper(delta=0.0001)                    # We stop if the gain of the optimization becomes too small
+    time_limit_control = DeadlineStopper(total_time=time)          # We impose a time limit (1000 seconds)
+    
+    
+    best_params = report_perf(opt, X_train, y_train,'XGBoost_regression', 
+                            callbacks=[overdone_control, time_limit_control])
+    
+    # Transferring the best parameters to our basic regressor
+    reg = xgb.XGBRegressor(random_state=0, booster='gbtree', objective='reg:squarederror', tree_method='gpu_hist', **best_params)
+    
+    
+    # Cross-validation prediction
+    folds = folds
+    skf = StratifiedKFold(n_splits=folds,
+                        shuffle=True, 
+                        random_state=0)
+
+    predictions = np.zeros(len(X_test))
+    rmse = list()
+
+    for k, (train_idx, val_idx) in enumerate(skf.split(X_train, y_stratified)):
+        reg.fit(X_train.iloc[train_idx, :], y_train[train_idx])
+        val_preds = reg.predict(X_train.iloc[val_idx, :])
+        val_rmse = mean_squared_error(y_true=y_train[val_idx], y_pred=val_preds, squared=False)
+        print(f"Fold {k} RMSE: {val_rmse:0.5f}")
+        rmse.append(val_rmse)
+        predictions += reg.predict(X_test).ravel()
+        
+    predictions /= folds
+    print(f"repeated CV RMSE: {np.mean(rmse):0.5f} (std={np.std(rmse):0.5f})")
+    
+    print(str(best_params))
+    # Preparing the submission
+    submission = pd.DataFrame({'id':X_test.index, 
+                            'target': predictions})
+    
+    return reg
