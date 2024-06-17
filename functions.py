@@ -5,6 +5,7 @@ import os
 import pyreadstat 
 from tqdm import tqdm
 from time import time
+import statsmodels.api as sm
 # create xgboost prediction model to predict the 2015 election results 
 
 import xgboost as xgb
@@ -110,7 +111,34 @@ def get_BES_data(df, min_vars = 20, max_vars = 25):
 
 
 
-
+def get_BES_data_v2(df, min_vars=20, max_vars=25):
+    # Efficiently filter columns that end with the specified wave suffixes
+    suffixes = [f'W{i}' for i in range(1, 26)]
+    cols = [c for c in df.columns if any(c.endswith(suffix) for suffix in suffixes)]
+    
+    # Extract variable names without using an intermediate DataFrame
+    var_name_counts = {}
+    for col in cols:
+        var_name = col.split('W')[0]
+        if var_name in var_name_counts:
+            var_name_counts[var_name] += 1
+        else:
+            var_name_counts[var_name] = 1
+    
+    # Select variable names that meet the min_vars and max_vars criteria
+    cols_to_keep = [col for col in cols if min_vars <= var_name_counts[col.split('W')[0]] <= max_vars]
+    
+    # Filter the DataFrame to keep only the necessary columns
+    df = df[cols_to_keep + ['id']]
+    
+    # Reshape the DataFrame using melt and pivot_table
+    df_melted = pd.melt(df, id_vars='id', value_vars=cols_to_keep)
+    df_melted['wave'] = df_melted['variable'].str.extract(r'W(\d+)$').astype(int)
+    df_melted['variable_name'] = df_melted['variable'].str.replace(r'W\d+$', '', regex=True)
+    
+    df_pivoted = df_melted.pivot_table(index=['id', 'wave'], columns='variable_name', values='value', aggfunc='first').reset_index()
+    
+    return df_pivoted
 
 
 
@@ -349,3 +377,77 @@ def xgboost_model(cols_to_drop,
                             'target': predictions})
     
     return reg
+
+
+
+
+
+# Function to harmonize census data for joint probability estimation
+
+def harmonize_census_data(df):
+    df.loc[df['Highest level of qualification (7 categories) Code'] == 4, 'social_grade'] = 'ABC1'
+    df.loc[df['Highest level of qualification (7 categories) Code'] != 4, 'social_grade'] = 'C2DE'
+    df['gender'] = df['Sex (2 categories)']
+    df.loc[df['Age (6 categories) Code'] == 2, 'age'] = '18-24'
+    df.loc[df['Age (6 categories) Code'] == 3, 'age'] = '25-49'
+    df.loc[df['Age (6 categories) Code'] == 4, 'age'] = '25-49'
+    df.loc[df['Age (6 categories) Code'] == 5, 'age'] = '50-64'
+    df.loc[df['Age (6 categories) Code'] == 6, 'age'] = '65+'
+    df['pcon_code'] = df['Westminster Parliamentary constituencies Code']
+    df = df.groupby(['pcon_code', 
+                'social_grade',
+                'age', 
+                'gender']).agg({'Observation': 'sum'}).reset_index()
+    
+    # create a total column for the total number of people in each constituency
+    df['total_population'] = df.groupby('pcon_code')['Observation'].transform('sum')
+    return df 
+
+
+
+
+
+def create_cd_data_agg(df):
+
+    cols_to_index = ['Highest level of qualification (7 categories)', 'Sex (2 categories)', 'Household deprivation (6 categories)', 'Age (6 categories)']
+
+
+    con_df = pd.DataFrame()
+    for col in cols_to_index:
+        z = index_by_constituency(df, col, col + '_comp')
+        con_df = pd.concat([con_df, z], axis=1)
+        
+        
+    # drop the multi-level columns
+    con_df.columns = [' '.join(col).strip() for col in con_df.columns.values]
+
+
+    abc1 = ['Highest level of qualification (7 categories)_comp Level 4 qualifications or above: degree (BA, BSc), higher degree (MA, PhD, PGCE), NVQ level 4 to 5, HNC, HND, RSA Higher Diploma, BTEC Higher level, professional qualifications (for example, teaching, nursing, accountancy)']
+
+    cde2 = ['Highest level of qualification (7 categories)_comp Does not apply', 
+            'Highest level of qualification (7 categories)_comp Level 1 and entry level qualifications: 1 to 4 GCSEs grade A* to C, Any GCSEs at other grades, O levels or CSEs (any grades), 1 AS level, NVQ level 1, Foundation GNVQ, Basic or Essential Skills',
+            'Highest level of qualification (7 categories)_comp Level 2 qualifications: 5 or more GCSEs (A* to C or 9 to 4), O levels (passes), CSEs (grade 1), School Certification, 1 A level, 2 to 3 AS levels, VCEs, Intermediate or Higher Diploma, Welsh Baccalaureate Intermediate Diploma, NVQ level 2, Intermediate GNVQ, City and Guilds Craft, BTEC First or General Diploma, RSA Diploma',
+        'Highest level of qualification (7 categories)_comp Level 3 qualifications: 2 or more A levels or VCEs, 4 or more AS levels, Higher School Certificate, Progression or Advanced Diploma, Welsh Baccalaureate Advance Diploma, NVQ level 3; Advanced GNVQ, City and Guilds Advanced Craft, ONC, OND, BTEC National, RSA Advanced Diploma',
+        'Highest level of qualification (7 categories)_comp No qualifications',
+        'Highest level of qualification (7 categories)_comp Other: apprenticeships, vocational or work-related qualifications, other qualifications achieved in England or Wales, qualifications achieved outside England or Wales (equivalent not stated or unknown)']
+
+       
+    con_df.rename(columns={'Age (6 categories)_comp Aged 15 years and under': 'age_15',
+            'Age (6 categories)_comp Aged 16 to 24 years': '18_24',
+            'Age (6 categories)_comp Aged 25 to 34 years': '25_34',
+            'Age (6 categories)_comp Aged 35 to 49 years': '35_49',
+            'Age (6 categories)_comp Aged 50 to 64 years': '50_64',
+            'Age (6 categories)_comp Aged 65 years and over': '65+',
+            'Sex (2 categories)_comp Female': 'Female', 
+            'Sex (2 categories)_comp Male': 'Male',
+            'abc1': 'ABC1', 
+            'cde2': 'C2DE',
+            'Westminster Parliamentary constituencies Code': 'pcon_code'}, inplace=True)
+
+    con_df['25_49'] = con_df['25_34'] + con_df['35_49']
+
+    # create a new column for the percentage of people with a degree
+    con_df['abc1'] = con_df[abc1].sum(axis=1)
+    con_df['cde2'] = con_df[cde2].sum(axis=1)
+    
+    return con_df
